@@ -1,0 +1,440 @@
+---
+title: "Prediction Competition - 2019 Governor Races"
+author: "Alec MacMillen"
+date: "10/23/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+library(tidyverse)
+library(modelr)
+library(skimr)
+library(lubridate)
+library(haven)
+library(broom)
+library(caret)
+library(stargazer)
+library(utils)
+library(survey)
+library(tidyr)
+
+setwd("C:/Users/Alec/Documents/Academics/Second Year/Fall Quarter/PPHA 31720 - The Science of Elections and Campaigns/Problem Sets/PS - Prediction Competition/gov-predictions-2019")
+```
+
+## Overview
+
+Explain project methodology here.
+
+## Model 1: Polls-only
+
+Explain polls-only overall here.
+
+### Part 1: Cleaning prior-year polling data
+
+Start by loading the raw FiveThirtyEight polling data and performing some basic transformations, including:
+
+- Converting the poll date and election date to date variables,
+- Calculating the number of days between the median date in field and election date,
+- Limiting to polls for gubernatorial and senatorial races,
+- Dropping races where the two primary candidates were not one Democrat and one Republican,
+- Calculating two-party vote shares in the poll and final election,
+- Selecting only relevant variables.
+
+```{r, include = FALSE}
+all_polls_raw <- read_csv("../data/raw-polls.csv")
+
+all_polls_int <- all_polls_raw %>%
+  mutate(polldate = mdy(polldate),
+         electiondate = mdy(electiondate),
+         daystoelection = as.numeric(electiondate - polldate)) %>%
+  filter(type_simple %in% c("Gov-G", "Sen-G"),
+         #location %in% south,
+         #polldate >= electiondate - lubridate::weeks(3),
+         # year >= 2010,
+         # Drop races where the two main candidates are not a Democrat and Republican
+         cand1_name == "Democrat" & cand2_name == "Republican") %>%
+  mutate(DemSharePoll = cand1_pct / (cand1_pct + cand2_pct),
+         RepSharePoll = cand2_pct / (cand1_pct + cand2_pct),
+         DemShareAct = cand1_actual / (cand1_actual + cand2_actual),
+         RepShareAct = cand2_actual / (cand1_actual + cand2_actual)) %>%
+  select(year, race, location, type_simple, samplesize,
+         daystoelection, ends_with("Poll"), ends_with("Act"), -margin_poll)
+
+```
+Now we'll create a \texttt{results} table with one row for each election (because in the raw data, the results data is replicated on every row for a poll regarding the corresponding election).
+
+```{r}
+results <- all_polls_int %>%
+  group_by(year, race, location, type_simple) %>%
+  summarize(DemShareAct = mean(DemShareAct),
+            RepShareAct = mean(RepShareAct))
+```
+
+Next, to come up with a weighted average of polls on a race-by-race basis, we'll calculate a "total sample size" variable \texttt{ss_total} that is merely the sum of the sample sizes for all polls associated with a given election so that we can weight polls with largely sample sizes more heavily.
+
+```{r}
+weights <- all_polls_int %>%
+  group_by(race) %>%
+  summarize(ss_total = sum(samplesize))
+```
+
+Now we'll calculated a weighted mean of all poll predictions (weighting directly on sample size and inversely on time to election) to come up with one single prediction for each election according to all the polls that were taken for it. We'll also output this summary table of all poll predictions for prior races into an intermediate output file \texttt{prior_year_polls.csv} for ease of access moving forward.
+
+```{r}
+all_polls_final <- all_polls_int %>%
+  left_join(weights, by = "race") %>%
+  # Create weights for sample size (greater ss = greater weight),
+  # days to election (more days to election = lower weight)
+  mutate(sswt = samplesize / ss_total,
+         dayswt = 1 / daystoelection,
+         # Apply weights to polls
+         DemSharePollWt = DemSharePoll*sswt*dayswt,
+         RepSharePollWt = RepSharePoll*sswt*dayswt) %>%
+  group_by(year, race, location, type_simple) %>%
+  # Average raw predictions
+  summarize(DemPredRaw = mean(DemSharePollWt),
+            RepPredRaw = mean(RepSharePollWt)) %>%
+  ungroup() %>% 
+  # Convertaverage  raw predictions into two-party vote shares
+  mutate(DemPredFinal = DemPredRaw / (DemPredRaw + RepPredRaw),
+         RepPredFinal = RepPredRaw / (DemPredRaw + RepPredRaw)) %>%
+  select(year, race, location, type_simple, DemPredFinal, RepPredFinal) %>%
+  # Merge onto actual results
+  left_join(results, by = c("year", "race", "location", "type_simple")) %>% 
+  mutate(idx = 1:n()) %>% 
+  select(idx, everything()) %>% 
+  filter(!is.na(DemPredFinal) & !is.na(DemShareAct))
+
+write_csv(all_polls_final, "../output/prior_year_polls.csv")
+```
+
+### Part 2: Cleaning current-year polling data
+
+FiveThirtyEight also has current polling data for 2019 races. Unfortunately, this data is in slightly different form to the historical polling database, so the cleaning process is slightly different and we will have to take a few extra steps to standardize.
+
+```{r, include=FALSE}
+gov_polls_raw <- read_csv("../data/governor_polls.csv")
+
+# The file common_cols.csv is a synthetic dataset designed to mimic the format
+# of the historical polling database - this will make joining the two together
+# easier
+common_cols <- read_csv("../data/common_cols.csv")
+```
+
+Now we will take several data cleaning steps, including:
+
+- Filter to include only KY, LA, and MS races (the only ones we care about),
+- Drop non-major party candidates,
+- Collapse party percentage support in a poll to a single row (currently, a single poll takes up multiple rows in the dataset),
+- Calculate the two-way vote share, which implicitly omits undecideds (we will address this by weighting polls closer to election day more heavily)
+- Convert date strings into proper date variables, date each poll by its median date in the field and use that variable to calculate time to election,
+- Select final relevant variables.
+
+```{r}
+gov_polls_int <- gov_polls_raw %>%
+  # Keep only relevant variables
+  select(poll_id, question_id, pollster_id, cycle, state, sample_size, population,
+         office_type, start_date, end_date, stage, answer, candidate_name,
+         candidate_party, pct) %>%
+
+  # Filter to only LA, KY, MS races in 2019
+  filter(state %in% c("Kentucky", "Louisiana", "Mississippi"),
+         cycle == 2019) %>%
+
+  # Drop non-major party candidates
+  filter(candidate_party %in% c("DEM", "REP")) %>%
+
+  # Get party percentage support in a single row
+  spread(key = candidate_party, value = pct) %>%
+  select(-c("stage", "answer", "candidate_name")) %>%
+  group_by(poll_id, question_id, pollster_id, cycle, state, sample_size, population,
+           office_type, start_date, end_date) %>%
+  summarize(DemSharePoll = max(DEM, na.rm = TRUE),
+            RepSharePoll = max(REP, na.rm = TRUE)) %>%
+  ungroup() %>%
+
+  # Calculate two-way vote share (this omits undecideds, account for this by
+  # weighting polls closer to election day more heavily)
+  mutate(Dem2WayShare = DemSharePoll / (DemSharePoll + RepSharePoll),
+         Rep2WayShare = RepSharePoll / (DemSharePoll + RepSharePoll),
+         samplesize = sample_size) %>%
+
+  # Convert date strings into datetime vars, create election date vars for each election
+  mutate(start_date = mdy(start_date),
+         end_date = mdy(end_date),
+
+         # Date the poll to its median date in the field assign election date to each
+         # election and find # of days until election
+         polldate = start_date - days(ceiling(as.numeric(end_date - start_date)/2)),
+         electiondate = as.Date(ifelse(state == "Louisiana", "11/16/2019", "11/5/2019"), "%m/%d/%Y"),
+         daystoelection = as.numeric(electiondate - polldate)) %>%
+
+  # Final select for relevant variables
+  select(state, samplesize, population, daystoelection, Dem2WayShare, Rep2WayShare)
+
+```
+
+Now we can follow the same weighted mean process that we performed for the prior-year polls to come up with an aggregated prediction for each of the three races we're predicting:
+
+```{r}
+# Create total sample size of all polls by race to create samplesize weight
+weights <- gov_polls_int %>%
+  group_by(state) %>%
+  summarize(ss_total = sum(samplesize))
+
+# By race, create a single weighted prediction of vote share using sample size and
+# days to election to combine all polls
+gov_polls_final <- gov_polls_int %>%
+  left_join(weights, by = "state") %>%
+  # Create "weights" for sample size (greater ss = greater weight),
+  # days to election (more days to election = lower weight)
+  mutate(sswt = samplesize / ss_total,
+         dayswt = 1 / daystoelection,
+         # Apply weights
+         DemSharePollWt = Dem2WayShare*sswt*dayswt,
+         RepSharePollWt = Rep2WayShare*sswt*dayswt) %>%
+  group_by(state) %>%
+  summarize(DemPredRaw = sum(DemSharePollWt),
+            RepPredRaw = sum(RepSharePollWt)) %>%
+  # Convert raw predictions into two-party vote shares
+  mutate(DemPredFinal = DemPredRaw / (DemPredRaw + RepPredRaw),
+         RepPredFinal = RepPredRaw / (DemPredRaw + RepPredRaw))
+
+# Merge with common_cols file to keep columns aligned across each dataset
+gov_polls_output <- common_cols %>%
+  left_join(gov_polls_final, by = "state") %>%
+  select(-c("state", "DemPredRaw", "RepPredRaw")) %>%
+  mutate(DemShareAct = NA, RepShareAct = NA)
+```
+
+### Part 3: Regression models
+
+Now we'll use OLS regression and a leave-one-out strategy 
+
+```{r, include = FALSE}
+# Create a vector of southern states for differential filtering
+south <- sort(c("LA", "MS", "AL", "GA", "SC", "TX", "AR", "TN", "NC", "FL",
+                "OK", "KY", "WV", "VA", "DE", "MD"))
+
+# All possible combinations of filter strings (for elections since 2010, states in
+# the south, and governor's races)
+filter_strings <- c("", "year >= 2010", "location %in% south", "type_simple == 'Gov-G'",
+                    "year >= 2010 & location %in% south", "year >= 2010 & type_simple == 'Gov-G'",
+                    "location %in% south & type_simple == 'Gov-G'", 
+                    "year >= 2010 & location %in% south & type_simple == 'Gov-G'")
+
+# Cycle through all filter iterations, perform the leave-one-out cross-validation, and
+# store model predictions
+gov_polls_pred <- gov_polls_output
+for (s in filter_strings) {
+  eval(parse(text = paste0("df <- all_polls_final %>% filter(", s, ")")))
+  model <- train(DemShareAct ~ DemPredFinal, data = df, method = "lm",
+                 trControl = trainControl(method = "LOOCV"))
+  
+  gov_polls_pred <- gov_polls_pred %>% 
+    spread_predictions(model) %>% 
+    rename(model_ = model)
+}
+
+# Some column renaming/adjustment
+cols <- which(names(gov_polls_pred) == "model_")
+names(gov_polls_pred)[cols] <- paste0("model_", seq_along(cols))
+
+# Average all model predictions together
+gov_polls_pred <- gov_polls_pred %>% 
+  rename(model1 = 9, model2 = 10, model3 = 11, model4 = 12, 
+         model5 = 13, model6 = 14, model7 = 15, model8 = 16) %>% 
+  mutate(meanPredDemVoteSh = rowMeans(.[9:16])) %>% 
+  select(year, location, meanPredDemVoteSh)
+```
+
+This is the final prediction of the polls-only model:
+
+```{r}
+gov_polls_pred
+```
+
+## Model 2: Demographic and historical
+
+### Background
+
+Note that you're doing predictions in 2018 based on the statewide House vote.
+
+```{r}
+cces2014 <- haven::read_dta("../data/CCES14_Common_Content_Validated.dta")
+cces2015 <- haven::read_dta("../data/CCES15_Common_OUTPUT_Jan2016.dta")
+cces2018 <- read_csv("../data/cces18_common_vv.csv")
+```
+
+```{r}
+design14 <- function(fips) {
+  state <- cces2014 %>% filter(inputstate == fips & !is.na(weight))
+  
+  small <- state %>% 
+    select(weight, birthyr:race, inputstate, CC360, HouseCand1Party, HouseCand2Party) %>% 
+    # Filter to two-party preference in House election
+    filter(CC360 %in% c(1, 2)) %>% 
+    # Recode categorical vars as factors
+    mutate(gender = recode(as.factor(gender), `1` = 0L, `2` = 1L),
+           race = recode(as.factor(race), `1` = 1L, `2` = 2L, `3` = 3L, `4` = 4L, `5` = 5L,
+                         `6` = 5L, `7` = 5L, `8` = 5L, .default = 5L),
+           educ = recode(as.factor(educ), `1` = 1L, `2` = 2L, `3` = 3L, `4` = 4L, `5` = 5L, .default = 1L),
+           age = as.factor(cut(2014 - birthyr, breaks = c(17, 35, 50, 65, 110))),
+           votedem = recode(ifelse(as.factor(CC360) == 1, 1, 0), `0` = 0L, `1` = 1L)) %>% 
+    # Select only relevant vars
+    select(weight, gender, race, educ, age, votedem)
+  
+  design <- svydesign(id = ~0, weights = ~weight, data = small)
+}
+```
+
+```{r}
+design15 <- function(fips) {
+  state <- cces2015 %>% filter(inputstate == fips & !is.na(weight))
+  
+  small <- state %>% 
+    select(weight, birthyr:race, inputstate, starts_with("CC15_316")) %>% 
+    # Filter to two-party preference in governor election
+    filter(CC15_316a %in% c(1, 2) | CC15_316b %in% c(1, 2) | CC15_316c %in% c(1, 2)) %>% 
+    # Recode categorical vars as factors
+    mutate(gender = recode(as.factor(gender), `1` = 0L, `2` = 1L),
+           race = recode(as.factor(race), `1` = 1L, `2` = 2L, `3` = 3L, `4` = 4L, `5` = 5L,
+                         `6` = 5L, `7` = 5L, `8` = 5L, .default = 5L),
+           educ = recode(as.factor(educ), `1` = 1L, `2` = 2L, `3` = 3L, `4` = 4L, `5` = 5L, .default = 1L),
+           age = as.factor(cut(2015 - as.numeric(birthyr), breaks = c(17, 35, 50, 65, 110))))
+  
+  if (fips == 21) {
+    small <- small %>% mutate(votedem = recode(as.factor(ifelse(CC15_316a == 2, 1, 0)), `0` = 0L, `1` = 1L))
+  } else if (fips == 22) {
+    small <- small %>% mutate(votedem = recode(as.factor(ifelse(CC15_316b == 1, 1, 0)), `0` = 0L, `1` = 1L))
+  } else if (fips == 28) {
+    small <- small %>% mutate(votedem = recode(as.factor(ifelse(CC15_316c == 2, 1, 0)), `0` = 0L, `1` = 1L))
+  }
+  
+  # Select only relevant vars
+  small <- small %>% select(weight, gender, race, educ, age, votedem)
+  
+  design <- svydesign(id = ~0, weights = ~weight, data = small)
+}
+```
+
+```{r}
+design18 <- function(fips) {
+  state <- cces2018 %>% filter(inputstate == fips & !is.na(vvweight_post))
+  
+  small <- state %>%
+    select(caseid:race, CC18_412, HouseCand1Party_post, HouseCand2Party_post) %>%
+    # Filter to two-party verified vote
+    filter(CC18_412 %in% c(1, 2)) %>%
+    # Recode categorical vars as factors
+    mutate(gender = recode(gender, `1` = 0L, `2` = 1L),
+           race = recode(race, `1` = 1L, `2` = 2L, `3` = 3L, `4` = 4L, `5` = 5L,
+                         `6` = 5L, `7` = 5L, `8` = 5L, .default = 5L),
+           educ = recode(educ, `1` = 1L, `2` = 2L, `3` = 3L, `4` = 4L, `5` = 5L, .default = 1L),
+           age = as.factor(cut(2018 - birthyr, breaks = c(17, 35, 50, 65, 110))),
+           votedem = recode(ifelse(CC18_412 == 1, 1, 0), `0` = 0L, `1` = 1L)) %>%
+    select(vvweight_post, gender, race, educ, age, votedem)
+  
+  design <- svydesign(id = ~0, weights = ~vvweight_post, data = small)
+}
+
+# 2014
+ky14 <- design14(21)
+la14 <- design14(22)
+ms14 <- design14(28)
+
+# 2015
+ky15 <- design15(21)
+la15 <- design15(22)
+ms15 <- design15(28)
+
+# 2018
+ky18 <- design18(21)
+la18 <- design18(22)
+ms18 <- design18(28)
+
+# Quick check to see how closely these vote predictions from CCES match actual totals (2014)
+svymean(~votedem, ky14, na.rm=TRUE) # Predicted 39.73% Dem 2party US House vote share, actual 36.42%
+svymean(~votedem, la14, na.rm=TRUE) # Predicted 42.2% Dem 2party US House vote share, actual 30.87%
+svymean(~votedem, ms14, na.rm=TRUE) # Predicted 46.6% Dem 2party US House vote share, actual 41.1%
+
+# Quick check to see how closely these vote predictions from CCES match actual totals (2014)
+svymean(~votedem, ky15, na.rm=TRUE) # Predicted 47.03% Dem 2party Governor vote share, actual 45.48%
+svymean(~votedem, la15, na.rm=TRUE) # Predicted 56.87% Dem 2party Governor vote share, actual 56.2%
+svymean(~votedem, ms15, na.rm=TRUE) # Predicted 33.89% Dem 2party Governor vote share, actual 32.66%
+
+# Quick check to see how closely these vote predictions from CCES match actual totals (2018)
+svymean(~votedem, ky18, na.rm=TRUE) # Predicted 46.33% Dem 2party US House vote share, actual 39.59%
+svymean(~votedem, la18, na.rm=TRUE) # Predicted 38.39% Dem 2party US House vote share, actual 39.82%
+svymean(~votedem, ms18, na.rm=TRUE) # Predicted 40.14% Dem 2party US House vote share, actual 45.83%
+```
+
+
+```{r}
+build_electorate <- function(survey, year) {
+  #
+  demsupport <- as_tibble(prop.table(svytable(~gender + race + educ + age + votedem, design = survey))) %>% 
+    filter(votedem == 1) %>% 
+    select(-votedem) %>% 
+    rename(percentdem = n)
+  
+  cols <- c("percentdem")
+  to_append <- as.character(year)
+  demsupport <- demsupport %>% rename_at(cols, list(~paste0(., to_append)))
+}
+
+
+
+state_model <- function(fips) {
+  #
+  d14 <- design14(fips)
+  d15 <- design15(fips)
+  d18 <- design18(fips)
+  
+  e14 <- build_electorate(d14, 14)
+  e15 <- build_electorate(d15, 15)
+  e18 <- build_electorate(d18, 18)
+  
+  output <- e14 %>% 
+    left_join(e15, by = c("gender", "race", "educ", "age")) %>% 
+    left_join(e18, by = c("gender", "race", "educ", "age")) %>% 
+    replace_na(list(percentdem14 = 0, percentdem15 = 0, percentdem18 = 0))
+}
+
+
+ky_model <- state_model(21)
+la_model <- state_model(22)
+ms_model <- state_model(28)
+
+
+predict_vote_share <- function(model) {
+  #
+  prediction <- model %>% 
+    mutate(percentdem19 = .33*percentdem15 + .67*percentdem18)
+  
+  prediction %>% summarize(sum(percentdem19)) %>% .[[1]]
+}
+
+ky_cces <- predict_vote_share(ky_model)
+la_cces <- predict_vote_share(la_model)
+ms_cces <- predict_vote_share(ms_model)
+
+cces_pred <- tibble(year = 2019, location = c("KY", "LA", "MS"), cces_pred_pct = c(ky_cces, la_cces, ms_cces))
+
+all_pred <- gov_polls_pred %>% 
+  left_join(cces_pred, by = c("year", "location")) %>% 
+  mutate(FinalDemVtshPred = .67*meanPredDemVoteSh + .33*cces_pred_pct,
+         FinalRepVtshPred = 1 - FinalDemVtshPred) %>% 
+  select(location, FinalDemVtshPred, FinalRepVtshPred)
+
+all_pred
+```
+
+
+
+
+
+
+
